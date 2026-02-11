@@ -91,8 +91,138 @@ def format_for_print(df: pd.DataFrame) -> str:
     return f"{title}\n{separator}\n\n{df.to_string(index=False)}\n\n{legend}\n"
 
 
-def send_to_printer(text: str) -> None:
-    """Send a plain-text string to the default system printer.
+def list_printers() -> list[str]:
+    """Return a list of available printer names from the OS.
+
+    macOS/Linux — parses output of `lpstat -a` (CUPS).
+    Windows     — uses PowerShell `Get-Printer` cmdlet.
+
+    Returns an empty list if no printers are found or the command fails.
+    """
+    system = platform.system()
+
+    if system in ("Darwin", "Linux"):
+        # `lpstat -a` lists printers that are accepting jobs.
+        # Each line starts with the printer name followed by a space.
+        try:
+            result = subprocess.run(
+                ["lpstat", "-a"],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                return []
+            printers = []
+            for line in result.stdout.strip().splitlines():
+                # Format: "PrinterName accepting requests since ..."
+                name = line.split()[0] if line.strip() else None
+                if name:
+                    printers.append(name)
+            return printers
+        except FileNotFoundError:
+            return []
+
+    elif system == "Windows":
+        try:
+            result = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "Get-Printer | Select-Object -ExpandProperty Name",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                return []
+            return [p for p in result.stdout.strip().splitlines() if p.strip()]
+        except FileNotFoundError:
+            return []
+
+    return []
+
+
+class PrinterDialog(tk.Toplevel):
+    """Modal dialog that lets the user pick a printer from a list.
+
+    Usage:
+        dialog = PrinterDialog(parent, printers=["Printer1", "Printer2"])
+        parent.wait_window(dialog)
+        selected = dialog.selected_printer  # str or None if cancelled
+    """
+
+    def __init__(self, parent: tk.Tk, printers: list[str]) -> None:
+        super().__init__(parent)
+        self.selected_printer: str | None = None
+        self.title("Select Printer")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        # -- Printer list --
+        ttk.Label(self, text="Available printers:").pack(
+            padx=12, pady=(12, 4), anchor=tk.W
+        )
+
+        listbox_frame = ttk.Frame(self)
+        listbox_frame.pack(padx=12, fill=tk.BOTH, expand=True)
+
+        scrollbar = ttk.Scrollbar(listbox_frame, orient=tk.VERTICAL)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.listbox = tk.Listbox(
+            listbox_frame,
+            height=8,
+            width=40,
+            yscrollcommand=scrollbar.set,
+        )
+        scrollbar.config(command=self.listbox.yview)
+
+        for printer in printers:
+            self.listbox.insert(tk.END, printer)
+
+        # Pre-select the first printer
+        if printers:
+            self.listbox.selection_set(0)
+
+        self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # -- Buttons --
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(padx=12, pady=12, fill=tk.X)
+
+        ttk.Button(btn_frame, text="Cancel", command=self._on_cancel).pack(
+            side=tk.RIGHT, padx=(4, 0)
+        )
+        ttk.Button(btn_frame, text="Print", command=self._on_print).pack(
+            side=tk.RIGHT
+        )
+
+        # Allow double-click to select
+        self.listbox.bind("<Double-1>", lambda e: self._on_print())
+
+        # Center the dialog over the parent window
+        self.update_idletasks()
+        x = parent.winfo_x() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{x}+{y}")
+
+    def _on_print(self) -> None:
+        selection = self.listbox.curselection()
+        if selection:
+            self.selected_printer = self.listbox.get(selection[0])
+        self.destroy()
+
+    def _on_cancel(self) -> None:
+        self.destroy()
+
+
+def send_to_printer(text: str, printer: str | None = None) -> None:
+    """Send a plain-text string to a system printer.
+
+    If `printer` is given, prints to that specific printer.
+    Otherwise prints to the default printer.
 
     macOS  — pipes text to `lpr`, which talks to CUPS.
     Windows — writes a temp file and prints via PowerShell Out-Printer.
@@ -104,9 +234,13 @@ def send_to_printer(text: str) -> None:
     if system == "Darwin":
         # ------- macOS -------
         # `lpr` is the standard CUPS command-line print utility.
+        # `-P printer` selects a specific printer.
         # Passing text via stdin avoids needing a temp file on macOS.
+        cmd = ["lpr"]
+        if printer:
+            cmd += ["-P", printer]
         result = subprocess.run(
-            ["lpr"],
+            cmd,
             input=text.encode("utf-8"),
             capture_output=True,
         )
@@ -116,7 +250,7 @@ def send_to_printer(text: str) -> None:
     elif system == "Windows":
         # ------- Windows -------
         # PowerShell's Out-Printer cmdlet sends text directly to the
-        # default printer via the Windows print spooler.  It's built-in
+        # printer via the Windows print spooler.  It's built-in
         # on Windows 11 (PowerShell 5.1+), requires no extra packages,
         # and runs silently with no window flash.
         tmp = tempfile.NamedTemporaryFile(
@@ -126,14 +260,17 @@ def send_to_printer(text: str) -> None:
             tmp.write(text)
             tmp.close()  # flush & close before PowerShell reads it
             # Get-Content reads the file, Out-Printer sends it to the
-            # default printer.  `-NoProfile` speeds up startup by
+            # printer.  `-NoProfile` speeds up startup by
             # skipping the user's PowerShell profile scripts.
+            ps_cmd = f"Get-Content '{tmp.name}' | Out-Printer"
+            if printer:
+                ps_cmd = f"Get-Content '{tmp.name}' | Out-Printer -Name '{printer}'"
             result = subprocess.run(
                 [
                     "powershell",
                     "-NoProfile",
                     "-Command",
-                    f"Get-Content '{tmp.name}' | Out-Printer",
+                    ps_cmd,
                 ],
                 capture_output=True,
                 text=True,
@@ -149,8 +286,11 @@ def send_to_printer(text: str) -> None:
     else:
         # ------- Linux (bonus) -------
         # `lpr` also works on most Linux distros with CUPS installed.
+        cmd = ["lpr"]
+        if printer:
+            cmd += ["-P", printer]
         result = subprocess.run(
-            ["lpr"],
+            cmd,
             input=text.encode("utf-8"),
             capture_output=True,
         )
@@ -271,13 +411,28 @@ class TournamentApp(tk.Tk):
     def _on_print(self) -> None:
         """Handle the Print button click.
 
-        Formats the DataFrame, sends it to the printer, and shows
-        a success/error message.
+        Lists available printers, shows a selection dialog, then
+        formats the DataFrame and sends it to the chosen printer.
         """
+        printers = list_printers()
+        if not printers:
+            messagebox.showerror(
+                "Print Error", "No printers found on this system."
+            )
+            return
+
+        dialog = PrinterDialog(self, printers)
+        self.wait_window(dialog)
+
+        if dialog.selected_printer is None:
+            return  # user cancelled
+
         text = format_for_print(self.df)
         try:
-            send_to_printer(text)
-            messagebox.showinfo("Print", "Report sent to printer.")
+            send_to_printer(text, printer=dialog.selected_printer)
+            messagebox.showinfo(
+                "Print", f"Report sent to '{dialog.selected_printer}'."
+            )
         except RuntimeError as e:
             messagebox.showerror("Print Error", f"Could not print:\n{e}")
 
